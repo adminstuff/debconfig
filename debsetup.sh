@@ -25,9 +25,10 @@ log_warning() {
     echo -e "${YELLOW}[AVERTISSEMENT]${NC} $1"
 }
 
-# Vérifier si le script est exécuté en tant que root
+# Vérifier si l'utilisateur est root
 if [ "$EUID" -ne 0 ]; then
-    log_error "Ce script doit être exécuté en tant que root"
+    echo -e "${RED}[ERREUR]${NC} Ce script doit être exécuté en tant que root"
+    echo -e "Veuillez relancer le script avec la commande: ${YELLOW}sudo $0${NC}"
     exit 1
 fi
 
@@ -36,6 +37,127 @@ if [ ! -d "config" ]; then
     log_error "Le répertoire 'config' n'existe pas"
     exit 1
 fi
+
+# Variables pour suivre les modifications effectuées
+MODIFICATIONS=()
+NETWORK_MODIFIED=false
+
+# Fonction pour ajouter une modification à la liste
+add_modification() {
+    local description="$1"
+    MODIFICATIONS+=("$description")
+}
+
+# Fonction pour envoyer un résumé des modifications par email
+send_summary_email() {
+    log_info "Envoi du résumé des modifications par email..."
+    
+    # Demander l'adresse email
+    echo -n "Veuillez entrer l'adresse email pour recevoir le résumé des modifications : "
+    read -r EMAIL_ADDRESS
+    
+    # Vérifier que l'adresse email est valide (vérification basique)
+    if [[ ! "$EMAIL_ADDRESS" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        log_error "L'adresse email semble invalide"
+        echo -n "Voulez-vous continuer quand même ? (o/N) "
+        read -r answer
+        if [[ ! "$answer" =~ ^[oO][uU]?[iI]?$ ]]; then
+            log_info "Envoi du résumé par email annulé"
+            return 1
+        fi
+    fi
+    
+    # Générer le contenu de l'email
+    local HOSTNAME=$(hostname)
+    local DATE=$(date '+%Y-%m-%d %H:%M:%S')
+    local SUMMARY_FILE=$(mktemp)
+    
+    # En-tête de l'email
+    echo "Résumé des modifications effectuées par le script de configuration Debian" > "$SUMMARY_FILE"
+    echo "Serveur: $HOSTNAME" >> "$SUMMARY_FILE"
+    echo "Date: $DATE" >> "$SUMMARY_FILE"
+    echo "" >> "$SUMMARY_FILE"
+    
+    # Liste des modifications
+    echo "Modifications effectuées:" >> "$SUMMARY_FILE"
+    if [ ${#MODIFICATIONS[@]} -eq 0 ]; then
+        echo "Aucune modification n'a été effectuée" >> "$SUMMARY_FILE"
+    else
+        for ((i=0; i<${#MODIFICATIONS[@]}; i++)); do
+            echo "$((i+1)). ${MODIFICATIONS[$i]}" >> "$SUMMARY_FILE"
+        done
+    fi
+    
+    # Informations système
+    echo "" >> "$SUMMARY_FILE"
+    echo "Informations système:" >> "$SUMMARY_FILE"
+    echo "Version du système: $(cat /etc/debian_version)" >> "$SUMMARY_FILE"
+    echo "Noyau: $(uname -r)" >> "$SUMMARY_FILE"
+    
+    # Informations réseau
+    echo "" >> "$SUMMARY_FILE"
+    echo "Configuration réseau:" >> "$SUMMARY_FILE"
+    ip addr show | grep -E 'inet|link' >> "$SUMMARY_FILE"
+    
+    # Utilisateurs du système
+    echo "" >> "$SUMMARY_FILE"
+    echo "Utilisateurs avec UID > 1000:" >> "$SUMMARY_FILE"
+    while IFS=: read -r username _ uid _ _ home _; do
+        if [ "$uid" -gt 1000 ] && [ -d "$home" ]; then
+            echo "- $username (UID: $uid)" >> "$SUMMARY_FILE"
+        fi
+    done < /etc/passwd
+    
+    # Envoyer l'email
+    if command -v mail &> /dev/null; then
+        cat "$SUMMARY_FILE" | mail -s "Résumé de configuration Debian - $HOSTNAME" "$EMAIL_ADDRESS"
+        if [ $? -eq 0 ]; then
+            log_info "Résumé envoyé à $EMAIL_ADDRESS"
+        else
+            log_error "Échec de l'envoi du résumé par email"
+            cat "$SUMMARY_FILE"
+        fi
+    else
+        log_error "La commande 'mail' n'est pas disponible, impossible d'envoyer l'email"
+        log_info "Voici le résumé des modifications:"
+        cat "$SUMMARY_FILE"
+    fi
+    
+    # Supprimer le fichier temporaire
+    rm -f "$SUMMARY_FILE"
+    
+    return 0
+}
+
+# Fonction pour redémarrer le réseau à la fin du script
+restart_network_if_needed() {
+    if [ "$NETWORK_MODIFIED" = true ]; then
+        log_info "La configuration réseau a été modifiée"
+        echo -n "Voulez-vous redémarrer le réseau maintenant ? (o/N) "
+        read -r answer
+        
+        if [[ "$answer" =~ ^[oO][uU]?[iI]?$ ]]; then
+            log_info "Redémarrage du service réseau..."
+            systemctl restart networking
+            if [ $? -eq 0 ]; then
+                log_info "Réseau redémarré avec succès"
+            else
+                log_error "Échec du redémarrage du réseau"
+                log_warning "Il est recommandé de redémarrer le système"
+                echo -n "Voulez-vous redémarrer le système maintenant ? (o/N) "
+                read -r answer
+                
+                if [[ "$answer" =~ ^[oO][uU]?[iI]?$ ]]; then
+                    log_info "Redémarrage du système..."
+                    shutdown -r now
+                fi
+            fi
+        else
+            log_warning "Redémarrage du réseau ignoré"
+            log_warning "Les modifications réseau prendront effet au prochain redémarrage"
+        fi
+    fi
+}
 
 # Vérifier si une configuration existe déjà et demander confirmation
 check_existing_config() {
@@ -104,6 +226,7 @@ EOF
     apt-get update
     
     log_info "Configuration des sources APT terminée avec succès"
+    add_modification "Sources APT: Configuration pour Debian $DEBIAN_VERSION et suppression des entrées cdrom"
     return 0
 }
 
@@ -179,32 +302,20 @@ EOF
         echo "nameserver $DNS2" >> /etc/resolv.conf
     fi
     
-    # Redémarrage du service réseau
-    log_info "Redémarrage du service réseau..."
-    systemctl restart networking
+    # Marquer le réseau comme modifié
+    NETWORK_MODIFIED=true
+    add_modification "Configuration réseau: Interface $INTERFACE configurée avec l'adresse $IP_ADDRESS"
     
-    # Vérification de la connexion
-    log_info "Vérification de la connexion réseau..."
-    if ping -c 1 $GATEWAY > /dev/null 2>&1; then
-        log_info "Configuration réseau réussie!"
-        return 0
-    else
-        log_warning "Impossible de joindre la passerelle $GATEWAY"
-        log_warning "Veuillez vérifier votre configuration"
-        return 1
-    fi
+    # Le redémarrage du réseau se fera à la fin du script
+    log_info "Configuration réseau terminée"
+    log_info "Le réseau sera redémarré à la fin du script si vous le confirmez"
+    
+    return 0
 }
 
 # Changement du mot de passe root
 change_root_password() {
     log_info "Changement du mot de passe root..."
-    
-    ROOT_PASS_CONF="config/root_password.conf"
-    
-    if [ ! -f "$ROOT_PASS_CONF" ]; then
-        log_error "Le fichier $ROOT_PASS_CONF n'existe pas"
-        return 1
-    fi
     
     # Demander confirmation
     echo -n "Voulez-vous changer le mot de passe root ? (o/N) "
@@ -215,15 +326,23 @@ change_root_password() {
         return 0
     fi
     
-    # Lecture du mot de passe depuis le fichier de configuration
-    log_info "Lecture du mot de passe root depuis $ROOT_PASS_CONF"
-    source "$ROOT_PASS_CONF"
+    # Demander le nouveau mot de passe
+    echo -n "Entrez le nouveau mot de passe root : "
+    read -rs ROOT_PASSWORD
+    echo
+    echo -n "Confirmez le nouveau mot de passe root : "
+    read -rs ROOT_PASSWORD_CONFIRM
+    echo
     
-    # Vérification de la présence de la variable requise
+    # Vérifier que les mots de passe correspondent
+    if [ "$ROOT_PASSWORD" != "$ROOT_PASSWORD_CONFIRM" ]; then
+        log_error "Les mots de passe ne correspondent pas"
+        return 1
+    fi
+    
+    # Vérifier que le mot de passe n'est pas vide
     if [ -z "$ROOT_PASSWORD" ]; then
-        log_error "Le fichier de configuration du mot de passe root est incomplet"
-        log_error "Format attendu:"
-        log_error "ROOT_PASSWORD=mot_de_passe_sécurisé"
+        log_error "Le mot de passe ne peut pas être vide"
         return 1
     fi
     
@@ -233,6 +352,7 @@ change_root_password() {
     
     if [ $? -eq 0 ]; then
         log_info "Mot de passe root changé avec succès"
+        add_modification "Mot de passe root modifié"
         return 0
     else
         log_error "Échec du changement du mot de passe root"
@@ -318,6 +438,7 @@ EOF
     # Vérification que sendmail est en cours d'exécution
     if systemctl is-active --quiet sendmail; then
         log_info "Configuration sendmail terminée avec succès"
+        add_modification "Configuration sendmail: Relais configuré vers $MAIL_RELAY"
         return 0
     else
         log_error "Échec du démarrage de sendmail"
@@ -379,6 +500,7 @@ configure_sudoers() {
         cp $SUDOERS_TMP /etc/sudoers.d/users
         chmod 0440 /etc/sudoers.d/users
         log_info "Configuration des sudoers terminée avec succès"
+        add_modification "Configuration sudoers: Utilisateurs avec UID > 1000 ajoutés aux sudoers"
     else
         log_error "Erreur dans la syntaxe du fichier sudoers"
         cat $SUDOERS_TMP
@@ -450,6 +572,7 @@ configure_firewall() {
     iptables-save > /etc/iptables/rules.v4
     
     log_info "Configuration du pare-feu terminée avec succès"
+    add_modification "Pare-feu: Configuration iptables avec règles de sécurité de base"
     return 0
 }
 
@@ -532,7 +655,10 @@ EOF
     # Redémarrage du service SSH
     systemctl restart sshd
     
+    # Finalisation
     log_info "Configuration de la sécurité de base terminée avec succès"
+    add_modification "Sécurité de base: Installation de fail2ban et configuration des mises à jour automatiques"
+    add_modification "Sécurité SSH: Paramètres de sécurité renforcés"
     return 0
 }
 
@@ -648,6 +774,7 @@ EOF
         if command -v snmpwalk &> /dev/null; then
             if snmpwalk -v2c -c "$SNMP_COMMUNITY" localhost system > /dev/null 2>&1; then
                 log_info "Configuration SNMP terminée avec succès"
+                add_modification "SNMP: Service configuré avec communauté '$SNMP_COMMUNITY' et restrictions d'accès"
                 return 0
             else
                 log_warning "SNMP semble fonctionner mais le test a échoué"
@@ -663,6 +790,246 @@ EOF
         log_error "Vérifiez les journaux système pour plus de détails"
         return 1
     fi
+}
+
+# Installation et configuration du serveur SSH
+configure_ssh() {
+    log_info "Installation et configuration du serveur SSH..."
+    
+    # Vérifier si SSH est déjà installé
+    if ! command -v sshd &> /dev/null; then
+        log_info "Installation du serveur SSH..."
+        apt-get update
+        apt-get install -y openssh-server
+    else
+        log_info "Le serveur SSH est déjà installé"
+    fi
+    
+    # Vérifier si une configuration SSH existe déjà
+    if ! check_existing_config "SSH" "/etc/ssh/sshd_config"; then
+        return 0
+    fi
+    
+    # Sauvegarde de la configuration SSH
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+    
+    # Configuration SSH sécurisée
+    log_info "Application d'une configuration SSH sécurisée..."
+    
+    # Modification des paramètres de sécurité SSH
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+    sed -i 's/#PermitEmptyPasswords no/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+    sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
+    sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
+    sed -i 's/#ClientAliveCountMax 3/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+    
+    # Redémarrage du service SSH
+    log_info "Redémarrage du service SSH..."
+    systemctl restart ssh
+    
+    # Activation du service SSH au démarrage
+    log_info "Activation du service SSH au démarrage..."
+    systemctl enable ssh
+    
+    # Vérification que SSH est en cours d'exécution
+    if systemctl is-active --quiet ssh; then
+        log_info "Configuration SSH terminée avec succès"
+        add_modification "SSH: Serveur installé et configuré avec paramètres de sécurité"
+        return 0
+    else
+        log_error "Échec du démarrage du service SSH"
+        log_error "Vérifiez les journaux système pour plus de détails"
+        return 1
+    fi
+}
+
+# Installation des outils standards
+install_standard_tools() {
+    log_info "Installation des outils standards..."
+    
+    # Liste des paquets à installer
+    PACKAGES="mlocate mailutils sendmail openssh-server"
+    
+    # Vérifier si les paquets sont déjà installés
+    PACKAGES_TO_INSTALL=""
+    for pkg in $PACKAGES; do
+        if ! dpkg -l | grep -q " $pkg "; then
+            PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL $pkg"
+        else
+            log_info "Le paquet $pkg est déjà installé"
+        fi
+    done
+    
+    # Si tous les paquets sont déjà installés
+    if [ -z "$PACKAGES_TO_INSTALL" ]; then
+        log_info "Tous les outils standards sont déjà installés"
+        add_modification "Outils standards: Tous les outils requis sont déjà installés"
+        return 0
+    fi
+    
+    # Installation des paquets manquants
+    log_info "Installation des paquets: $PACKAGES_TO_INSTALL"
+    apt-get update
+    apt-get install -y $PACKAGES_TO_INSTALL
+    
+    # Vérification de l'installation
+    FAILED_PACKAGES=""
+    for pkg in $PACKAGES_TO_INSTALL; do
+        if ! dpkg -l | grep -q " $pkg "; then
+            FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+        fi
+    done
+    
+    if [ -z "$FAILED_PACKAGES" ]; then
+        log_info "Installation des outils standards terminée avec succès"
+        
+        # Configuration initiale de mlocate
+        log_info "Mise à jour de la base de données mlocate..."
+        updatedb
+        
+        add_modification "Outils standards: Installation de mlocate, mailutils, sendmail, openssh-server"
+        return 0
+    else
+        log_error "Échec de l'installation des paquets: $FAILED_PACKAGES"
+        return 1
+    fi
+}
+
+# Configuration des alias
+configure_aliases() {
+    log_info "Configuration des alias..."
+    
+    ALIASES_CONF="config/aliases.conf"
+    
+    if [ ! -f "$ALIASES_CONF" ]; then
+        log_error "Le fichier $ALIASES_CONF n'existe pas"
+        return 1
+    fi
+    
+    # Vérifier si le fichier .bashrc existe pour chaque utilisateur
+    log_info "Lecture des alias depuis $ALIASES_CONF..."
+    
+    # Récupération de la liste des utilisateurs avec UID > 1000
+    USER_LIST=()
+    while IFS=: read -r username _ uid _ _ home _; do
+        if [ "$uid" -gt 1000 ] && [ -d "$home" ]; then
+            USER_LIST+=("$username:$home")
+        fi
+    done < /etc/passwd
+    
+    # Ajouter root à la liste
+    USER_LIST+=("root:/root")
+    
+    # Création du bloc d'alias à ajouter
+    ALIASES_BLOCK="# Aliases ajoutés par debian-config-script\n"
+    
+    # Lecture des alias depuis le fichier de configuration
+    while IFS=: read -r alias_name alias_command; do
+        # Ignorer les lignes vides ou commentées
+        if [[ -z "$alias_name" || "$alias_name" =~ ^# ]]; then
+            continue
+        fi
+        ALIASES_BLOCK+="alias $alias_name='$alias_command'\n"
+        log_info "Ajout de l'alias: $alias_name='$alias_command'"
+    done < "$ALIASES_CONF"
+    
+    # Ajouter les alias pour chaque utilisateur
+    for user_info in "${USER_LIST[@]}"; do
+        IFS=: read -r username home_dir <<< "$user_info"
+        BASHRC="$home_dir/.bashrc"
+        
+        if [ -f "$BASHRC" ]; then
+            log_info "Ajout des alias pour l'utilisateur $username..."
+            
+            # Vérifier si les alias sont déjà configurés
+            if grep -q "# Aliases ajoutés par debian-config-script" "$BASHRC"; then
+                log_warning "Des alias sont déjà configurés pour $username"
+                echo -n "Voulez-vous remplacer les alias existants ? (o/N) "
+                read -r answer
+                
+                if [[ "$answer" =~ ^[oO][uU]?[iI]?$ ]]; then
+                    # Supprimer les alias existants
+                    sed -i '/# Aliases ajoutés par debian-config-script/,/# Fin des aliases/d' "$BASHRC"
+                else
+                    log_info "Conservation des alias existants pour $username"
+                    continue
+                fi
+            fi
+            
+            # Ajouter les nouveaux alias
+            echo -e "\n$ALIASES_BLOCK# Fin des aliases\n" >> "$BASHRC"
+            log_info "Alias ajoutés pour $username"
+        else
+            log_warning "Le fichier .bashrc n'existe pas pour $username, création..."
+            echo -e "$ALIASES_BLOCK# Fin des aliases\n" > "$BASHRC"
+            chown "$username:$username" "$BASHRC"
+            log_info "Fichier .bashrc créé avec les alias pour $username"
+        fi
+    done
+    
+    log_info "Configuration des alias terminée avec succès"
+    add_modification "Alias: Configuration pour tous les utilisateurs à partir de $ALIASES_CONF"
+    return 0
+}
+
+# Ajout d'utilisateurs
+add_users() {
+    log_info "Ajout d'utilisateurs..."
+    
+    # Demander combien d'utilisateurs à ajouter
+    echo -n "Combien d'utilisateurs souhaitez-vous ajouter ? (0 pour ignorer) "
+    read -r num_users
+    
+    # Valider l'entrée
+    if ! [[ "$num_users" =~ ^[0-9]+$ ]]; then
+        log_error "Nombre invalide, ajout d'utilisateurs ignoré"
+        return 1
+    fi
+    
+    if [ "$num_users" -eq 0 ]; then
+        log_info "Aucun utilisateur à ajouter"
+        return 0
+    fi
+    
+    # Créer les utilisateurs
+    for ((i=1; i<=num_users; i++)); do
+        echo -n "Nom de l'utilisateur $i : "
+        read -r username
+        
+        # Vérifier si l'utilisateur existe déjà
+        if id "$username" &>/dev/null; then
+            log_warning "L'utilisateur $username existe déjà"
+            continue
+        fi
+        
+        # Demander si l'utilisateur doit être administrateur
+        echo -n "L'utilisateur $username doit-il être administrateur (sudoer) ? (o/N) "
+        read -r is_admin
+        
+        # Créer l'utilisateur
+        log_info "Création de l'utilisateur $username..."
+        useradd -m -s /bin/bash "$username"
+        
+        # Définir le mot de passe
+        echo -n "Entrez le mot de passe pour $username : "
+        read -rs password
+        echo
+        echo "$username:$password" | chpasswd
+        
+        # Ajouter l'utilisateur au groupe sudo si nécessaire
+        if [[ "$is_admin" =~ ^[oO][uU]?[iI]?$ ]]; then
+            log_info "Ajout de $username au groupe sudo..."
+            usermod -aG sudo "$username"
+        fi
+        
+        log_info "Utilisateur $username créé avec succès"
+    done
+    
+    log_info "Ajout d'utilisateurs terminé avec succès"
+    add_modification "Utilisateurs: $num_users nouveaux utilisateurs ajoutés"
+    return 0
 }
 
 # Configuration NTP (synchronisation de l'heure)
@@ -682,7 +1049,7 @@ configure_ntp() {
     log_info "Configuration des serveurs NTP..."
     cat > /etc/systemd/timesyncd.conf << EOF
 [Time]
-NTP=0.ch.pool.ntp.org 1.ch.pool.ntp.org 2.ch.pool.ntp.org 3.ch.pool.ntp.org
+NTP=0.fr.pool.ntp.org 1.fr.pool.ntp.org 2.fr.pool.ntp.org 3.fr.pool.ntp.org
 FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
 EOF
 
@@ -695,10 +1062,12 @@ EOF
     sleep 2
     if timedatectl status | grep -q "synchronized: yes"; then
         log_info "Synchronisation NTP réussie"
+        add_modification "NTP: Synchronisation configurée avec les serveurs fr.pool.ntp.org"
         return 0
     else
         log_warning "La synchronisation NTP n'est pas encore établie"
         log_warning "Vérifiez l'état avec 'timedatectl status'"
+        add_modification "NTP: Configuration effectuée mais synchronisation en attente"
         return 0
     fi
 }
@@ -712,15 +1081,19 @@ main() {
     echo "1. Configuration des sources APT"
     echo "2. Configuration IP"
     echo "3. Changement du mot de passe root"
-    echo "4. Configuration des utilisateurs sudoers"
-    echo "5. Configuration de sendmail"
-    echo "6. Configuration de la sécurité de base (optionnel)"
-    echo "7. Configuration du pare-feu (optionnel)"
-    echo "8. Configuration SNMP"
-    echo "9. Configuration NTP"
+    echo "4. Ajout d'utilisateurs"
+    echo "5. Configuration des utilisateurs sudoers"
+    echo "6. Configuration de sendmail"
+    echo "7. Configuration de la sécurité de base (optionnel)"
+    echo "8. Configuration du pare-feu (optionnel)"
+    echo "9. Configuration SNMP"
+    echo "10. Configuration NTP"
+    echo "11. Installation des outils standards (mlocate, mailutils, sendmail, ssh)"
+    echo "12. Installation et configuration du serveur SSH"
+    echo "13. Configuration des alias"
     echo "0. Tout configurer (avec confirmation pour chaque étape)"
     echo ""
-    echo -n "Choisissez une option (0-9) ou appuyez sur Entrée pour tout configurer : "
+    echo -n "Choisissez une option (0-13) ou appuyez sur Entrée pour tout configurer : "
     read -r choice
     
     # Si aucun choix n'est fait, configurer tout
@@ -832,6 +1205,15 @@ main() {
             fi
             ;;
         4)
+            # Ajout d'utilisateurs
+            if add_users; then
+                log_info "Ajout d'utilisateurs terminé avec succès"
+            else
+                log_error "Échec ou annulation de l'ajout d'utilisateurs"
+                exit 1
+            fi
+            ;;
+        5)
             # Configuration des utilisateurs sudoers
             if configure_sudoers; then
                 log_info "Configuration des utilisateurs sudoers terminée avec succès"
@@ -840,7 +1222,7 @@ main() {
                 exit 1
             fi
             ;;
-        5)
+        6)
             # Configuration de sendmail
             if configure_sendmail; then
                 log_info "Configuration de sendmail terminée avec succès"
@@ -849,7 +1231,7 @@ main() {
                 exit 1
             fi
             ;;
-        6)
+        7)
             # Configuration de la sécurité de base
             if configure_basic_security; then
                 log_info "Configuration de la sécurité de base terminée avec succès"
@@ -857,7 +1239,7 @@ main() {
                 log_warning "Configuration de la sécurité de base ignorée ou annulée"
             fi
             ;;
-        7)
+        8)
             # Configuration du pare-feu
             if configure_firewall; then
                 log_info "Configuration du pare-feu terminée avec succès"
@@ -865,7 +1247,7 @@ main() {
                 log_warning "Configuration du pare-feu ignorée ou annulée"
             fi
             ;;
-        8)
+        9)
             # Configuration SNMP
             if configure_snmp; then
                 log_info "Configuration SNMP terminée avec succès"
@@ -874,12 +1256,39 @@ main() {
                 exit 1
             fi
             ;;
-        9)
+        10)
             # Configuration NTP
             if configure_ntp; then
                 log_info "Configuration NTP terminée avec succès"
             else
                 log_error "Échec ou annulation de la configuration NTP"
+                exit 1
+            fi
+            ;;
+        11)
+            # Installation des outils standards
+            if install_standard_tools; then
+                log_info "Installation des outils standards terminée avec succès"
+            else
+                log_error "Échec ou annulation de l'installation des outils standards"
+                exit 1
+            fi
+            ;;
+        12)
+            # Installation et configuration du serveur SSH
+            if configure_ssh; then
+                log_info "Configuration SSH terminée avec succès"
+            else
+                log_error "Échec ou annulation de la configuration SSH"
+                exit 1
+            fi
+            ;;
+        13)
+            # Configuration des alias
+            if configure_aliases; then
+                log_info "Configuration des alias terminée avec succès"
+            else
+                log_error "Échec ou annulation de la configuration des alias"
                 exit 1
             fi
             ;;
@@ -890,6 +1299,12 @@ main() {
     esac
     
     log_info "Configuration automatique terminée"
+    
+    # Redémarrer le réseau si nécessaire
+    restart_network_if_needed
+    
+    # Envoyer un résumé des modifications par email
+    send_summary_email
 }
 
 # Exécution de la fonction principale
